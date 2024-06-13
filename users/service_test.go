@@ -14,10 +14,10 @@ import (
 	authmocks "github.com/absmach/magistrala/auth/mocks"
 	"github.com/absmach/magistrala/internal/testsutil"
 	mgclients "github.com/absmach/magistrala/pkg/clients"
+	constraints "github.com/absmach/magistrala/pkg/constraints/config"
 	"github.com/absmach/magistrala/pkg/errors"
 	repoerr "github.com/absmach/magistrala/pkg/errors/repository"
 	svcerr "github.com/absmach/magistrala/pkg/errors/service"
-	mgoauth2 "github.com/absmach/magistrala/pkg/oauth2"
 	"github.com/absmach/magistrala/pkg/uuid"
 	"github.com/absmach/magistrala/users"
 	"github.com/absmach/magistrala/users/hasher"
@@ -28,12 +28,13 @@ import (
 )
 
 var (
-	idProvider     = uuid.New()
-	phasher        = hasher.New()
-	secret         = "strongsecret"
-	validCMetadata = mgclients.Metadata{"role": "client"}
-	clientID       = testsutil.GenerateUUID(&testing.T{})
-	client         = mgclients.Client{
+	idProvider             = uuid.New()
+	constraintsProvider, _ = constraints.New("users_test")
+	phasher                = hasher.New()
+	secret                 = "strongsecret"
+	validCMetadata         = mgclients.Metadata{"role": "client"}
+	clientID               = testsutil.GenerateUUID(&testing.T{})
+	client                 = mgclients.Client{
 		ID:          clientID,
 		Name:        "clientname",
 		Tags:        []string{"tag1", "tag2"},
@@ -56,7 +57,7 @@ func newService(selfRegister bool) (users.Service, *mocks.Repository, *authmocks
 	cRepo := new(mocks.Repository)
 	auth := new(authmocks.AuthClient)
 	e := new(mocks.Emailer)
-	return users.NewService(cRepo, auth, e, phasher, idProvider, selfRegister), cRepo, auth, e
+	return users.NewService(cRepo, auth, e, phasher, idProvider, constraintsProvider, selfRegister), cRepo, auth, e
 }
 
 func TestRegisterClient(t *testing.T) {
@@ -65,6 +66,7 @@ func TestRegisterClient(t *testing.T) {
 	cases := []struct {
 		desc                      string
 		client                    mgclients.Client
+		total                     uint64
 		identifyResponse          *magistrala.IdentityRes
 		addPoliciesResponse       *magistrala.AddPoliciesRes
 		deletePoliciesResponse    *magistrala.DeletePoliciesRes
@@ -265,9 +267,10 @@ func TestRegisterClient(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("AddPolicies", context.Background(), mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesResponseErr)
-		repoCall1 := auth.On("DeletePolicies", context.Background(), mock.Anything).Return(tc.deletePoliciesResponse, tc.deletePoliciesResponseErr)
-		repoCall2 := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.client, tc.saveErr)
+		authCall := auth.On("AddPolicies", context.Background(), mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesResponseErr)
+		authCall1 := auth.On("DeletePolicies", context.Background(), mock.Anything).Return(tc.deletePoliciesResponse, tc.deletePoliciesResponseErr)
+		repoCall := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.client, tc.saveErr)
+		retrieveAllCall := cRepo.On("RetrieveAll", mock.Anything, mgclients.Page{}).Return(mgclients.ClientsPage{Page: mgclients.Page{Total: tc.total}}, nil)
 		expected, err := svc.RegisterClient(context.Background(), tc.token, tc.client)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		if err == nil {
@@ -277,12 +280,13 @@ func TestRegisterClient(t *testing.T) {
 			tc.client.Credentials.Secret = expected.Credentials.Secret
 			tc.client.UpdatedBy = expected.UpdatedBy
 			assert.Equal(t, tc.client, expected, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.client, expected))
-			ok := repoCall2.Parent.AssertCalled(t, "Save", context.Background(), mock.Anything)
+			ok := repoCall.Parent.AssertCalled(t, "Save", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("Save was not called on %s", tc.desc))
 		}
-		repoCall2.Unset()
-		repoCall1.Unset()
 		repoCall.Unset()
+		authCall1.Unset()
+		authCall.Unset()
+		retrieveAllCall.Unset()
 	}
 
 	svc, cRepo, auth, _ = newService(false)
@@ -295,6 +299,7 @@ func TestRegisterClient(t *testing.T) {
 		addPoliciesResponse       *magistrala.AddPoliciesRes
 		deletePoliciesResponse    *magistrala.DeletePoliciesRes
 		token                     string
+		total                     uint64
 		identifyErr               error
 		authorizeErr              error
 		addPoliciesResponseErr    error
@@ -325,6 +330,7 @@ func TestRegisterClient(t *testing.T) {
 			identifyResponse:  &magistrala.IdentityRes{UserId: wrongID},
 			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
 			token:             validToken,
+			identifyErr:       svcerr.ErrAuthorization,
 			err:               svcerr.ErrAuthorization,
 		},
 		{
@@ -338,12 +344,13 @@ func TestRegisterClient(t *testing.T) {
 		},
 	}
 	for _, tc := range cases2 {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := auth.On("AddPolicies", context.Background(), mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesResponseErr)
-		repoCall4 := auth.On("DeletePolicies", context.Background(), mock.Anything).Return(tc.deletePoliciesResponse, tc.deletePoliciesResponseErr)
-		repoCall5 := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.client, tc.saveErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		authCall2 := auth.On("AddPolicies", context.Background(), mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesResponseErr)
+		authCall3 := auth.On("DeletePolicies", context.Background(), mock.Anything).Return(tc.deletePoliciesResponse, tc.deletePoliciesResponseErr)
+		repoCall1 := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.client, tc.saveErr)
+		retrieveAllCall := cRepo.On("RetrieveAll", mock.Anything, mgclients.Page{}).Return(mgclients.ClientsPage{Page: mgclients.Page{Total: tc.total}}, nil)
 		expected, err := svc.RegisterClient(context.Background(), tc.token, tc.client)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		if err == nil {
@@ -353,16 +360,17 @@ func TestRegisterClient(t *testing.T) {
 			tc.client.Credentials.Secret = expected.Credentials.Secret
 			tc.client.UpdatedBy = expected.UpdatedBy
 			assert.Equal(t, tc.client, expected, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.client, expected))
-			ok := repoCall5.Parent.AssertCalled(t, "Save", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "Save", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("Save was not called on %s", tc.desc))
 		}
 
-		repoCall5.Unset()
-		repoCall4.Unset()
-		repoCall3.Unset()
-		repoCall2.Unset()
 		repoCall1.Unset()
+		authCall3.Unset()
+		authCall2.Unset()
 		repoCall.Unset()
+		authCall1.Unset()
+		authCall.Unset()
+		retrieveAllCall.Unset()
 	}
 }
 
@@ -453,24 +461,24 @@ func TestViewClient(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("RetrieveByID", context.Background(), tc.clientID).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("RetrieveByID", context.Background(), tc.clientID).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
 
 		rClient, err := svc.ViewClient(context.Background(), tc.token, tc.clientID)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		tc.response.Credentials.Secret = ""
 		assert.Equal(t, tc.response, rClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.response, rClient))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.clientID)
+			ok := repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.clientID)
 			assert.True(t, ok, fmt.Sprintf("RetrieveByID was not called on %s", tc.desc))
 		}
 
-		repoCall3.Unset()
-		repoCall2.Unset()
 		repoCall1.Unset()
 		repoCall.Unset()
+		authCall1.Unset()
+		authCall.Unset()
 	}
 }
 
@@ -544,7 +552,7 @@ func TestListClients(t *testing.T) {
 			retrieveAllResponse: mgclients.ClientsPage{},
 			token:               validToken,
 			retrieveAllErr:      repoerr.ErrNotFound,
-			err:                 svcerr.ErrNotFound,
+			err:                 svcerr.ErrViewEntity,
 		},
 		{
 			desc: "list clients as admin with failed check on super admin",
@@ -568,7 +576,7 @@ func TestListClients(t *testing.T) {
 				Page: mgclients.Page{
 					Total: 1,
 				},
-				Clients: []mgclients.Client{client},
+				Clients: []mgclients.Client{basicClient},
 			},
 			response: mgclients.ClientsPage{
 				Page: mgclients.Page{
@@ -589,26 +597,26 @@ func TestListClients(t *testing.T) {
 			retrieveAllResponse: mgclients.ClientsPage{},
 			token:               validToken,
 			retrieveAllErr:      repoerr.ErrNotFound,
-			err:                 svcerr.ErrNotFound,
+			err:                 svcerr.ErrViewEntity,
 		},
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.superAdminErr)
-		repoCall3 := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.retrieveAllResponse, tc.retrieveAllErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.superAdminErr)
+		repoCall1 := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.retrieveAllResponse, tc.retrieveAllErr)
 		page, err := svc.ListClients(context.Background(), tc.token, tc.page)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.response, page, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.response, page))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "RetrieveAll", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "RetrieveAll", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("RetrieveAll was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
 	}
 }
 
@@ -723,22 +731,22 @@ func TestUpdateClient(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("Update", context.Background(), mock.Anything).Return(tc.updateResponse, tc.err)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("Update", context.Background(), mock.Anything).Return(tc.updateResponse, tc.err)
 		updatedClient, err := svc.UpdateClient(context.Background(), tc.token, tc.client)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.updateResponse, updatedClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.updateResponse, updatedClient))
 
 		if tc.err == nil {
-			ok := repoCall2.Parent.AssertCalled(t, "Update", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "Update", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("Update was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
 	}
 }
 
@@ -807,6 +815,7 @@ func TestUpdateClientTags(t *testing.T) {
 			client:            client,
 			identifyResponse:  &magistrala.IdentityRes{UserId: wrongID},
 			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
+			identifyErr:       svcerr.ErrAuthorization,
 			token:             validToken,
 			err:               svcerr.ErrAuthorization,
 		},
@@ -832,22 +841,22 @@ func TestUpdateClientTags(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("UpdateTags", context.Background(), mock.Anything).Return(tc.updateClientTagsResponse, tc.updateClientTagsErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("UpdateTags", context.Background(), mock.Anything).Return(tc.updateClientTagsResponse, tc.updateClientTagsErr)
 
 		updatedClient, err := svc.UpdateClientTags(context.Background(), tc.token, tc.client)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.updateClientTagsResponse, updatedClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.updateClientTagsResponse, updatedClient))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "UpdateTags", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "UpdateTags", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("UpdateTags was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
 	}
 }
 
@@ -925,6 +934,7 @@ func TestUpdateClientIdentity(t *testing.T) {
 			id:                client.ID,
 			identifyResponse:  &magistrala.IdentityRes{UserId: wrongID},
 			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
+			identifyErr:       svcerr.ErrAuthorization,
 			err:               svcerr.ErrAuthorization,
 		},
 		{
@@ -951,22 +961,22 @@ func TestUpdateClientIdentity(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("UpdateIdentity", context.Background(), mock.Anything).Return(tc.updateClientIdentityResponse, tc.updateClientIdentityErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("UpdateIdentity", context.Background(), mock.Anything).Return(tc.updateClientIdentityResponse, tc.updateClientIdentityErr)
 
 		updatedClient, err := svc.UpdateClientIdentity(context.Background(), tc.token, tc.id, tc.identity)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.updateClientIdentityResponse, updatedClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.updateClientIdentityResponse, updatedClient))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "UpdateIdentity", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "UpdateIdentity", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("UpdateIdentity was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
 	}
 }
 
@@ -977,17 +987,39 @@ func TestUpdateClientRole(t *testing.T) {
 	client.Role = mgclients.AdminRole
 	client2.Role = mgclients.UserRole
 
+	superAdminAuthReq := &magistrala.AuthorizeReq{
+		SubjectType: authsvc.UserType,
+		SubjectKind: authsvc.UsersKind,
+		Subject:     client.ID,
+		Permission:  authsvc.AdminPermission,
+		ObjectType:  authsvc.PlatformType,
+		Object:      authsvc.MagistralaObject,
+	}
+
+	membershipAuthReq := &magistrala.AuthorizeReq{
+		SubjectType: authsvc.UserType,
+		SubjectKind: authsvc.UsersKind,
+		Subject:     client.ID,
+		Permission:  authsvc.MembershipPermission,
+		ObjectType:  authsvc.PlatformType,
+		Object:      authsvc.MagistralaObject,
+	}
+
 	cases := []struct {
 		desc                 string
 		client               mgclients.Client
 		identifyResponse     *magistrala.IdentityRes
-		authorizeResponse    *magistrala.AuthorizeRes
+		superAdminAuthReq    *magistrala.AuthorizeReq
+		membershipAuthReq    *magistrala.AuthorizeReq
+		superAdminAuthRes    *magistrala.AuthorizeRes
+		membershipAuthRes    *magistrala.AuthorizeRes
 		deletePolicyResponse *magistrala.DeletePolicyRes
 		addPolicyResponse    *magistrala.AddPolicyRes
 		updateRoleResponse   mgclients.Client
 		token                string
 		identifyErr          error
 		authorizeErr         error
+		membershipAuthErr    error
 		deletePolicyErr      error
 		addPolicyErr         error
 		updateRoleErr        error
@@ -997,62 +1029,80 @@ func TestUpdateClientRole(t *testing.T) {
 		{
 			desc:               "update client role successfully",
 			client:             client,
+			superAdminAuthReq:  superAdminAuthReq,
 			identifyResponse:   &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:  &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:  membershipAuthReq,
+			membershipAuthRes:  &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthRes:  &magistrala.AuthorizeRes{Authorized: true},
 			addPolicyResponse:  &magistrala.AddPolicyRes{Added: true},
 			updateRoleResponse: client,
 			token:              validToken,
 			err:                nil,
 		},
 		{
-			desc:             "update client role with invalid token",
-			client:           client,
-			identifyResponse: &magistrala.IdentityRes{},
-			identifyErr:      svcerr.ErrAuthentication,
-			token:            inValidToken,
-			err:              svcerr.ErrAuthentication,
+			desc:              "update client role with invalid token",
+			client:            client,
+			token:             inValidToken,
+			superAdminAuthReq: superAdminAuthReq,
+			superAdminAuthRes: &magistrala.AuthorizeRes{Authorized: true},
+			identifyResponse:  &magistrala.IdentityRes{},
+			identifyErr:       svcerr.ErrAuthentication,
+			err:               svcerr.ErrAuthentication,
 		},
 		{
 			desc:              "update client role with invalid ID",
 			client:            client,
 			identifyResponse:  &magistrala.IdentityRes{UserId: wrongID},
-			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
+			superAdminAuthReq: superAdminAuthReq,
+			superAdminAuthRes: &magistrala.AuthorizeRes{Authorized: true},
 			token:             validToken,
+			identifyErr:       svcerr.ErrAuthorization,
 			err:               svcerr.ErrAuthorization,
 		},
 		{
 			desc:               "update client role with failed check on super admin",
 			client:             client,
 			identifyResponse:   &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:  &magistrala.AuthorizeRes{Authorized: false},
-			checkSuperAdminErr: svcerr.ErrAuthorization,
+			superAdminAuthReq:  superAdminAuthReq,
+			superAdminAuthRes:  &magistrala.AuthorizeRes{Authorized: false},
 			token:              validToken,
+			checkSuperAdminErr: svcerr.ErrAuthorization,
 			err:                svcerr.ErrAuthorization,
 		},
 		{
 			desc:              "update client role with failed authorization on add policy",
 			client:            client,
 			identifyResponse:  &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse: &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthReq: superAdminAuthReq,
+			superAdminAuthRes: &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq: membershipAuthReq,
+			membershipAuthRes: &magistrala.AuthorizeRes{Authorized: true},
 			addPolicyResponse: &magistrala.AddPolicyRes{Added: false},
 			token:             validToken,
+			authorizeErr:      svcerr.ErrAuthorization,
 			err:               svcerr.ErrAuthorization,
 		},
 		{
 			desc:              "update client role with failed to add policy",
 			client:            client,
+			superAdminAuthReq: superAdminAuthReq,
 			identifyResponse:  &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse: &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthRes: &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq: membershipAuthReq,
+			membershipAuthRes: &magistrala.AuthorizeRes{Authorized: true},
 			addPolicyResponse: &magistrala.AddPolicyRes{},
-			addPolicyErr:      errors.ErrMalformedEntity,
 			token:             validToken,
+			addPolicyErr:      errors.ErrMalformedEntity,
 			err:               svcerr.ErrAddPolicies,
 		},
 		{
 			desc:                 "update client role to user role successfully  ",
 			client:               client2,
 			identifyResponse:     &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthReq:    superAdminAuthReq,
+			superAdminAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:    membershipAuthReq,
+			membershipAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
 			deletePolicyResponse: &magistrala.DeletePolicyRes{Deleted: true},
 			updateRoleResponse:   client2,
 			token:                validToken,
@@ -1060,17 +1110,26 @@ func TestUpdateClientRole(t *testing.T) {
 		},
 		{
 			desc:                 "update client role to user role with failed to delete policy",
+			client:               client2,
+			superAdminAuthReq:    superAdminAuthReq,
 			identifyResponse:     &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:    membershipAuthReq,
+			membershipAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
 			deletePolicyResponse: &magistrala.DeletePolicyRes{Deleted: false},
 			updateRoleResponse:   mgclients.Client{},
 			token:                validToken,
+			deletePolicyErr:      svcerr.ErrAuthorization,
 			err:                  svcerr.ErrAuthorization,
 		},
 		{
 			desc:                 "update client role to user role with failed to delete policy with error",
+			client:               client2,
 			identifyResponse:     &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthReq:    superAdminAuthReq,
+			superAdminAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:    membershipAuthReq,
+			membershipAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
 			deletePolicyResponse: &magistrala.DeletePolicyRes{Deleted: false},
 			updateRoleResponse:   mgclients.Client{},
 			token:                validToken,
@@ -1080,8 +1139,11 @@ func TestUpdateClientRole(t *testing.T) {
 		{
 			desc:                 "Update client with failed repo update and roll back",
 			client:               client,
+			superAdminAuthReq:    superAdminAuthReq,
 			identifyResponse:     &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:    membershipAuthReq,
+			membershipAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
 			addPolicyResponse:    &magistrala.AddPolicyRes{Added: true},
 			deletePolicyResponse: &magistrala.DeletePolicyRes{Deleted: true},
 			updateRoleResponse:   mgclients.Client{},
@@ -1093,7 +1155,10 @@ func TestUpdateClientRole(t *testing.T) {
 			desc:                 "Update client with failed repo update and failedroll back",
 			client:               client,
 			identifyResponse:     &magistrala.IdentityRes{UserId: client.ID},
-			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: true},
+			superAdminAuthReq:    superAdminAuthReq,
+			superAdminAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq:    membershipAuthReq,
+			membershipAuthRes:    &magistrala.AuthorizeRes{Authorized: true},
 			addPolicyResponse:    &magistrala.AddPolicyRes{Added: true},
 			deletePolicyResponse: &magistrala.DeletePolicyRes{Deleted: false},
 			updateRoleResponse:   mgclients.Client{},
@@ -1101,29 +1166,43 @@ func TestUpdateClientRole(t *testing.T) {
 			updateRoleErr:        svcerr.ErrAuthentication,
 			err:                  svcerr.ErrAuthentication,
 		},
+		{
+			desc:              "update client role with failed MembershipPermission authorization",
+			client:            client,
+			identifyResponse:  &magistrala.IdentityRes{UserId: client.ID},
+			superAdminAuthReq: superAdminAuthReq,
+			superAdminAuthRes: &magistrala.AuthorizeRes{Authorized: true},
+			membershipAuthReq: membershipAuthReq,
+			membershipAuthRes: &magistrala.AuthorizeRes{Authorized: false},
+			token:             validToken,
+			membershipAuthErr: svcerr.ErrAuthorization,
+			err:               svcerr.ErrAuthorization,
+		},
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := auth.On("AddPolicy", context.Background(), mock.Anything).Return(tc.addPolicyResponse, tc.addPolicyErr)
-		repoCall4 := auth.On("DeletePolicy", context.Background(), mock.Anything).Return(tc.deletePolicyResponse, tc.deletePolicyErr)
-		repoCall5 := cRepo.On("UpdateRole", context.Background(), mock.Anything).Return(tc.updateRoleResponse, tc.updateRoleErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), tc.superAdminAuthReq).Return(tc.superAdminAuthRes, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		authCall2 := auth.On("Authorize", context.Background(), tc.membershipAuthReq).Return(tc.membershipAuthRes, tc.membershipAuthErr)
+		authCall3 := auth.On("AddPolicy", context.Background(), mock.Anything).Return(tc.addPolicyResponse, tc.addPolicyErr)
+		authCall4 := auth.On("DeletePolicy", context.Background(), mock.Anything).Return(tc.deletePolicyResponse, tc.deletePolicyErr)
+		repoCall1 := cRepo.On("UpdateRole", context.Background(), mock.Anything).Return(tc.updateRoleResponse, tc.updateRoleErr)
 
 		updatedClient, err := svc.UpdateClientRole(context.Background(), tc.token, tc.client)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.updateRoleResponse, updatedClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.updateRoleResponse, updatedClient))
 		if tc.err == nil {
-			ok := repoCall5.Parent.AssertCalled(t, "UpdateRole", context.Background(), mock.Anything)
+			ok := repoCall1.Parent.AssertCalled(t, "UpdateRole", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("UpdateRole was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
+		authCall2.Unset()
+		authCall3.Unset()
+		authCall4.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
-		repoCall4.Unset()
-		repoCall5.Unset()
 	}
 }
 
@@ -1232,28 +1311,28 @@ func TestUpdateClientSecret(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := cRepo.On("RetrieveByID", context.Background(), client.ID).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
-		repoCall2 := cRepo.On("RetrieveByIdentity", context.Background(), client.Credentials.Identity).Return(tc.retrieveByIdentityResponse, tc.retrieveByIdentityErr)
-		repoCall3 := cRepo.On("UpdateSecret", context.Background(), mock.Anything).Return(tc.updateSecretResponse, tc.updateSecretErr)
-		repoCall4 := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		repoCall := cRepo.On("RetrieveByID", context.Background(), client.ID).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		repoCall1 := cRepo.On("RetrieveByIdentity", context.Background(), client.Credentials.Identity).Return(tc.retrieveByIdentityResponse, tc.retrieveByIdentityErr)
+		repoCall2 := cRepo.On("UpdateSecret", context.Background(), mock.Anything).Return(tc.updateSecretResponse, tc.updateSecretErr)
+		authCall1 := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
 
 		updatedClient, err := svc.UpdateClientSecret(context.Background(), tc.token, tc.oldSecret, tc.newSecret)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.response, updatedClient, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.response, updatedClient))
 		if tc.err == nil {
-			ok := repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.response.ID)
+			ok := repoCall.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.response.ID)
 			assert.True(t, ok, fmt.Sprintf("RetrieveByID was not called on %s", tc.desc))
-			ok = repoCall2.Parent.AssertCalled(t, "RetrieveByIdentity", context.Background(), tc.response.Credentials.Identity)
+			ok = repoCall1.Parent.AssertCalled(t, "RetrieveByIdentity", context.Background(), tc.response.Credentials.Identity)
 			assert.True(t, ok, fmt.Sprintf("RetrieveByIdentity was not called on %s", tc.desc))
-			ok = repoCall3.Parent.AssertCalled(t, "UpdateSecret", context.Background(), mock.Anything)
+			ok = repoCall2.Parent.AssertCalled(t, "UpdateSecret", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("UpdateSecret was not called on %s", tc.desc))
 		}
+		authCall.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
 		repoCall2.Unset()
-		repoCall3.Unset()
-		repoCall4.Unset()
+		authCall1.Unset()
 	}
 }
 
@@ -1304,13 +1383,17 @@ func TestEnableClient(t *testing.T) {
 			err:              svcerr.ErrAuthentication,
 		},
 		{
-			desc:              "enable disabled client with failed to authorize",
-			id:                disabledClient1.ID,
-			token:             validToken,
-			client:            disabledClient1,
-			identifyResponse:  &magistrala.IdentityRes{UserId: disabledClient1.ID},
-			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
-			err:               svcerr.ErrAuthorization,
+			desc:                 "enable disabled client with failed to authorize",
+			id:                   disabledClient1.ID,
+			token:                validToken,
+			client:               disabledClient1,
+			identifyResponse:     &magistrala.IdentityRes{UserId: disabledClient1.ID},
+			authorizeResponse:    &magistrala.AuthorizeRes{Authorized: false},
+			retrieveByIDResponse: mgclients.Client{},
+			changeStatusResponse: mgclients.Client{},
+			response:             mgclients.Client{},
+			identifyErr:          svcerr.ErrAuthorization,
+			err:                  svcerr.ErrAuthorization,
 		},
 		{
 			desc:               "enable disabled client with normal user token",
@@ -1358,25 +1441,25 @@ func TestEnableClient(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("RetrieveByID", context.Background(), tc.id).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
-		repoCall4 := cRepo.On("ChangeStatus", context.Background(), mock.Anything).Return(tc.changeStatusResponse, tc.changeStatusErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("RetrieveByID", context.Background(), tc.id).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		repoCall2 := cRepo.On("ChangeStatus", context.Background(), mock.Anything).Return(tc.changeStatusResponse, tc.changeStatusErr)
 
 		_, err := svc.EnableClient(context.Background(), tc.token, tc.id)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.id)
+			ok := repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.id)
 			assert.True(t, ok, fmt.Sprintf("RetrieveByID was not called on %s", tc.desc))
-			ok = repoCall4.Parent.AssertCalled(t, "ChangeStatus", context.Background(), mock.Anything)
+			ok = repoCall2.Parent.AssertCalled(t, "ChangeStatus", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("ChangeStatus was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
 		repoCall2.Unset()
-		repoCall3.Unset()
-		repoCall4.Unset()
 	}
 
 	cases2 := []struct {
@@ -1432,17 +1515,17 @@ func TestEnableClient(t *testing.T) {
 			Limit:  100,
 			Status: tc.status,
 		}
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: validToken}).Return(&magistrala.IdentityRes{UserId: client.ID}, nil)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(&magistrala.AuthorizeRes{Authorized: true}, nil)
-		repoCall2 := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.response, nil)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: validToken}).Return(&magistrala.IdentityRes{UserId: client.ID}, nil)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(&magistrala.AuthorizeRes{Authorized: true}, nil)
+		repoCall := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.response, nil)
 
 		page, err := svc.ListClients(context.Background(), validToken, pm)
 		require.Nil(t, err, fmt.Sprintf("unexpected error: %s", err))
 		size := uint64(len(page.Clients))
 		assert.Equal(t, tc.size, size, fmt.Sprintf("%s: expected size %d got %d\n", tc.desc, tc.size, size))
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
-		repoCall1.Unset()
-		repoCall2.Unset()
 	}
 }
 
@@ -1499,6 +1582,7 @@ func TestDisableClient(t *testing.T) {
 			client:            enabledClient1,
 			identifyResponse:  &magistrala.IdentityRes{UserId: disabledClient1.ID},
 			authorizeResponse: &magistrala.AuthorizeRes{Authorized: false},
+			identifyErr:       svcerr.ErrAuthorization,
 			err:               svcerr.ErrAuthorization,
 		},
 		{
@@ -1547,25 +1631,25 @@ func TestDisableClient(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
-		repoCall3 := cRepo.On("RetrieveByID", context.Background(), tc.id).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
-		repoCall4 := cRepo.On("ChangeStatus", context.Background(), mock.Anything).Return(tc.changeStatusResponse, tc.changeStatusErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(tc.authorizeResponse, tc.authorizeErr)
+		repoCall := cRepo.On("CheckSuperAdmin", context.Background(), mock.Anything).Return(tc.checkSuperAdminErr)
+		repoCall1 := cRepo.On("RetrieveByID", context.Background(), tc.id).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		repoCall2 := cRepo.On("ChangeStatus", context.Background(), mock.Anything).Return(tc.changeStatusResponse, tc.changeStatusErr)
 
 		_, err := svc.DisableClient(context.Background(), tc.token, tc.id)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		if tc.err == nil {
-			ok := repoCall3.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.id)
+			ok := repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), tc.id)
 			assert.True(t, ok, fmt.Sprintf("RetrieveByID was not called on %s", tc.desc))
-			ok = repoCall4.Parent.AssertCalled(t, "ChangeStatus", context.Background(), mock.Anything)
+			ok = repoCall2.Parent.AssertCalled(t, "ChangeStatus", context.Background(), mock.Anything)
 			assert.True(t, ok, fmt.Sprintf("ChangeStatus was not called on %s", tc.desc))
 		}
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
 		repoCall2.Unset()
-		repoCall3.Unset()
-		repoCall4.Unset()
 	}
 
 	cases2 := []struct {
@@ -1621,17 +1705,17 @@ func TestDisableClient(t *testing.T) {
 			Limit:  100,
 			Status: tc.status,
 		}
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: validToken}).Return(&magistrala.IdentityRes{UserId: client.ID}, nil)
-		repoCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(&magistrala.AuthorizeRes{Authorized: true}, nil)
-		repoCall2 := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.response, nil)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: validToken}).Return(&magistrala.IdentityRes{UserId: client.ID}, nil)
+		authCall1 := auth.On("Authorize", context.Background(), mock.Anything).Return(&magistrala.AuthorizeRes{Authorized: true}, nil)
+		repoCall := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.response, nil)
 
 		page, err := svc.ListClients(context.Background(), validToken, pm)
 		require.Nil(t, err, fmt.Sprintf("unexpected error: %s", err))
 		size := uint64(len(page.Clients))
 		assert.Equal(t, tc.size, size, fmt.Sprintf("%s: expected size %d got %d\n", tc.desc, tc.size, size))
+		authCall.Unset()
+		authCall1.Unset()
 		repoCall.Unset()
-		repoCall1.Unset()
-		repoCall2.Unset()
 	}
 }
 
@@ -2086,21 +2170,21 @@ func TestListMembers(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", context.Background(), tc.authorizeReq).Return(tc.authorizeResponse, tc.authorizeErr)
-		repoCall2 := auth.On("ListAllSubjects", context.Background(), tc.listAllSubjectsReq).Return(tc.listAllSubjectsResponse, tc.listAllSubjectsErr)
-		repoCall3 := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.retrieveAllResponse, tc.retrieveAllErr)
-		repoCall4 := auth.On("ListPermissions", mock.Anything, mock.Anything).Return(tc.listPermissionsResponse, tc.listPermissionErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		authCall1 := auth.On("Authorize", context.Background(), tc.authorizeReq).Return(tc.authorizeResponse, tc.authorizeErr)
+		authCall2 := auth.On("ListAllSubjects", context.Background(), tc.listAllSubjectsReq).Return(tc.listAllSubjectsResponse, tc.listAllSubjectsErr)
+		repoCall := cRepo.On("RetrieveAll", context.Background(), mock.Anything).Return(tc.retrieveAllResponse, tc.retrieveAllErr)
+		authCall3 := auth.On("ListPermissions", mock.Anything, mock.Anything).Return(tc.listPermissionsResponse, tc.listPermissionErr)
 
 		page, err := svc.ListMembers(context.Background(), tc.token, tc.objectKind, tc.objectID, tc.page)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		assert.Equal(t, tc.response, page, fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.response, page))
 
+		authCall.Unset()
+		authCall1.Unset()
+		authCall2.Unset()
 		repoCall.Unset()
-		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
-		repoCall4.Unset()
+		authCall3.Unset()
 	}
 }
 
@@ -2337,14 +2421,14 @@ func TestGenerateResetToken(t *testing.T) {
 
 	for _, tc := range cases {
 		repoCall := cRepo.On("RetrieveByIdentity", context.Background(), tc.email).Return(tc.retrieveByIdentityResponse, tc.retrieveByIdentityErr)
-		repoCall1 := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
+		authCall := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
 
 		svcCall := e.On("SendPasswordReset", []string{tc.email}, tc.host, client.Name, validToken).Return(tc.err)
 		err := svc.GenerateResetToken(context.Background(), tc.email, tc.host)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		repoCall.Parent.AssertCalled(t, "RetrieveByIdentity", context.Background(), tc.email)
 		repoCall.Unset()
-		repoCall1.Unset()
+		authCall.Unset()
 		svcCall.Unset()
 	}
 }
@@ -2438,19 +2522,19 @@ func TestResetSecret(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := cRepo.On("RetrieveByID", context.Background(), mock.Anything).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
-		repoCall2 := cRepo.On("UpdateSecret", context.Background(), mock.Anything).Return(tc.updateSecretResponse, tc.updateSecretErr)
+		authCall := auth.On("Identify", context.Background(), &magistrala.IdentityReq{Token: tc.token}).Return(tc.identifyResponse, tc.identifyErr)
+		repoCall := cRepo.On("RetrieveByID", context.Background(), mock.Anything).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		repoCall1 := cRepo.On("UpdateSecret", context.Background(), mock.Anything).Return(tc.updateSecretResponse, tc.updateSecretErr)
 
 		err := svc.ResetSecret(context.Background(), tc.token, tc.newSecret)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 
-		repoCall2.Parent.AssertCalled(t, "UpdateSecret", context.Background(), mock.Anything)
-		repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), client.ID)
-		repoCall.Parent.AssertCalled(t, "Identify", mock.Anything, mock.Anything)
-		repoCall.Unset()
-		repoCall2.Unset()
+		repoCall1.Parent.AssertCalled(t, "UpdateSecret", context.Background(), mock.Anything)
+		repoCall.Parent.AssertCalled(t, "RetrieveByID", context.Background(), client.ID)
+		authCall.Parent.AssertCalled(t, "Identify", mock.Anything, mock.Anything)
+		authCall.Unset()
 		repoCall1.Unset()
+		repoCall.Unset()
 	}
 }
 
@@ -2502,16 +2586,16 @@ func TestViewProfile(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		repoCall := auth.On("Identify", context.Background(), mock.Anything).Return(tc.identifyResponse, tc.identifyErr)
-		repoCall1 := cRepo.On("RetrieveByID", context.Background(), mock.Anything).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
+		authCall := auth.On("Identify", context.Background(), mock.Anything).Return(tc.identifyResponse, tc.identifyErr)
+		repoCall := cRepo.On("RetrieveByID", context.Background(), mock.Anything).Return(tc.retrieveByIDResponse, tc.retrieveByIDErr)
 
 		_, err := svc.ViewProfile(context.Background(), tc.token)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 
-		repoCall.Parent.AssertCalled(t, "Identify", mock.Anything, mock.Anything)
-		repoCall1.Parent.AssertCalled(t, "RetrieveByID", context.Background(), mock.Anything)
+		authCall.Parent.AssertCalled(t, "Identify", mock.Anything, mock.Anything)
+		repoCall.Parent.AssertCalled(t, "RetrieveByID", context.Background(), mock.Anything)
+		authCall.Unset()
 		repoCall.Unset()
-		repoCall1.Unset()
 	}
 }
 
@@ -2520,31 +2604,34 @@ func TestOAuthCallback(t *testing.T) {
 
 	cases := []struct {
 		desc                       string
-		state                      mgoauth2.State
 		client                     mgclients.Client
+		total                      uint64
 		retrieveByIdentityResponse mgclients.Client
 		retrieveByIdentityErr      error
 		addPoliciesResponse        *magistrala.AddPoliciesRes
 		addPoliciesErr             error
-		deletePoliciesResponse     *magistrala.DeletePoliciesRes
-		deletePoliciesErr          error
 		saveResponse               mgclients.Client
 		saveErr                    error
+		deletePoliciesResponse     *magistrala.DeletePoliciesRes
+		deletePoliciesErr          error
+		authorizeResponse          *magistrala.AuthorizeRes
+		authorizeErr               error
 		issueResponse              *magistrala.Token
 		issueErr                   error
 		err                        error
 	}{
 		{
-			desc:  "oauth signin callback with successfully",
-			state: mgoauth2.SignIn,
+			desc: "oauth signin callback with successfully",
 			client: mgclients.Client{
 				Credentials: mgclients.Credentials{
 					Identity: "test@example.com",
 				},
 			},
 			retrieveByIdentityResponse: mgclients.Client{
-				ID: testsutil.GenerateUUID(t),
+				ID:   testsutil.GenerateUUID(t),
+				Role: mgclients.UserRole,
 			},
+			authorizeResponse: &magistrala.AuthorizeRes{Authorized: true},
 			issueResponse: &magistrala.Token{
 				AccessToken:  strings.Repeat("a", 10),
 				RefreshToken: &validToken,
@@ -2553,37 +2640,20 @@ func TestOAuthCallback(t *testing.T) {
 			err: nil,
 		},
 		{
-			desc:  "oauth signin callback with error",
-			state: mgoauth2.SignIn,
+			desc: "oauth signup callback with successfully",
 			client: mgclients.Client{
 				Credentials: mgclients.Credentials{
 					Identity: "test@example.com",
 				},
 			},
-			retrieveByIdentityResponse: mgclients.Client{},
-			retrieveByIdentityErr:      repoerr.ErrNotFound,
-			issueResponse:              &magistrala.Token{},
-			err:                        errors.New("user not signed up"),
-		},
-		{
-			desc:  "oauth signup callback with successfully",
-			state: mgoauth2.SignUp,
-			client: mgclients.Client{
-				Credentials: mgclients.Credentials{
-					Identity: "test@example.com",
-				},
-			},
-			retrieveByIdentityResponse: mgclients.Client{
-				ID: testsutil.GenerateUUID(t),
-			},
+			retrieveByIdentityErr: repoerr.ErrNotFound,
 			addPoliciesResponse: &magistrala.AddPoliciesRes{
 				Added: true,
 			},
-			addPoliciesErr: nil,
 			saveResponse: mgclients.Client{
-				ID: testsutil.GenerateUUID(t),
+				ID:   testsutil.GenerateUUID(t),
+				Role: mgclients.UserRole,
 			},
-			saveErr: nil,
 			issueResponse: &magistrala.Token{
 				AccessToken:  strings.Repeat("a", 10),
 				RefreshToken: &validToken,
@@ -2592,61 +2662,113 @@ func TestOAuthCallback(t *testing.T) {
 			err: nil,
 		},
 		{
-			desc:  "oauth signup callback with error",
-			state: mgoauth2.SignUp,
+			desc: "oauth signup callback with unknown error",
+			client: mgclients.Client{
+				Credentials: mgclients.Credentials{
+					Identity: "test@example.com",
+				},
+			},
+			retrieveByIdentityErr: repoerr.ErrMalformedEntity,
+			err:                   repoerr.ErrMalformedEntity,
+		},
+		{
+			desc: "oauth signup callback with failed to register user",
+			client: mgclients.Client{
+				Credentials: mgclients.Credentials{
+					Identity: "test@example.com",
+				},
+			},
+			retrieveByIdentityErr: repoerr.ErrNotFound,
+			addPoliciesResponse:   &magistrala.AddPoliciesRes{Added: false},
+			addPoliciesErr:        svcerr.ErrAuthorization,
+			err:                   svcerr.ErrAuthorization,
+		},
+		{
+			desc: "oauth signin callback with user not in the platform",
 			client: mgclients.Client{
 				Credentials: mgclients.Credentials{
 					Identity: "test@example.com",
 				},
 			},
 			retrieveByIdentityResponse: mgclients.Client{
-				ID: testsutil.GenerateUUID(t),
+				ID:   testsutil.GenerateUUID(t),
+				Role: mgclients.UserRole,
 			},
-			addPoliciesResponse: &magistrala.AddPoliciesRes{
-				Added: true,
+			authorizeResponse:   &magistrala.AuthorizeRes{Authorized: false},
+			authorizeErr:        svcerr.ErrAuthorization,
+			addPoliciesResponse: &magistrala.AddPoliciesRes{Added: true},
+			issueResponse: &magistrala.Token{
+				AccessToken:  strings.Repeat("a", 10),
+				RefreshToken: &validToken,
+				AccessType:   "Bearer",
 			},
-			addPoliciesErr: nil,
-			deletePoliciesResponse: &magistrala.DeletePoliciesRes{
-				Deleted: true,
+			err: nil,
+		},
+		{
+			desc: "oauth signin callback with user not in the platform and failed to add policy",
+			client: mgclients.Client{
+				Credentials: mgclients.Credentials{
+					Identity: "test@example.com",
+				},
 			},
-			deletePoliciesErr: nil,
-			saveResponse:      mgclients.Client{},
-			saveErr:           repoerr.ErrConflict,
-			issueResponse:     &magistrala.Token{},
-			err:               errors.New("user already exists"),
+			retrieveByIdentityResponse: mgclients.Client{
+				ID:   testsutil.GenerateUUID(t),
+				Role: mgclients.UserRole,
+			},
+			authorizeResponse:   &magistrala.AuthorizeRes{Authorized: false},
+			authorizeErr:        svcerr.ErrAuthorization,
+			addPoliciesResponse: &magistrala.AddPoliciesRes{Added: false},
+			addPoliciesErr:      svcerr.ErrAuthorization,
+			err:                 svcerr.ErrAuthorization,
+		},
+		{
+			desc: "oauth signin callback with failed to issue token",
+			client: mgclients.Client{
+				Credentials: mgclients.Credentials{
+					Identity: "test@example.com",
+				},
+			},
+			retrieveByIdentityResponse: mgclients.Client{
+				ID:   testsutil.GenerateUUID(t),
+				Role: mgclients.UserRole,
+			},
+			authorizeResponse: &magistrala.AuthorizeRes{Authorized: true},
+			issueErr:          svcerr.ErrAuthorization,
+			err:               svcerr.ErrAuthorization,
 		},
 	}
 
 	for _, tc := range cases {
-		switch tc.state {
-		case mgoauth2.SignUp:
-			repoCall := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.saveResponse, tc.saveErr)
-			repoCall1 := auth.On("AddPolicies", context.Background(), mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesErr)
-			repoCall2 := auth.On("DeletePolicies", context.Background(), mock.Anything).Return(tc.deletePoliciesResponse, tc.deletePoliciesErr)
-			repoCall3 := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
-
-			token, err := svc.OAuthCallback(context.Background(), tc.state, tc.client)
-			if err == nil {
-				assert.Equal(t, tc.issueResponse.AccessToken, token.AccessToken)
-				assert.Equal(t, tc.issueResponse.RefreshToken, token.RefreshToken)
-			}
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
-			repoCall1.Unset()
-			repoCall2.Unset()
-			repoCall3.Unset()
-		case mgoauth2.SignIn:
-			repoCall := cRepo.On("RetrieveByIdentity", context.Background(), tc.client.Credentials.Identity).Return(tc.retrieveByIdentityResponse, tc.retrieveByIdentityErr)
-			repoCall1 := auth.On("Issue", context.Background(), mock.Anything).Return(tc.issueResponse, tc.issueErr)
-			token, err := svc.OAuthCallback(context.Background(), tc.state, tc.client)
-			if err == nil {
-				assert.Equal(t, tc.issueResponse.AccessToken, token.AccessToken)
-				assert.Equal(t, tc.issueResponse.RefreshToken, token.RefreshToken)
-			}
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Parent.AssertCalled(t, "RetrieveByIdentity", context.Background(), tc.client.Credentials.Identity)
-			repoCall.Unset()
-			repoCall1.Unset()
+		id := tc.saveResponse.ID
+		if tc.retrieveByIdentityResponse.ID != "" {
+			id = tc.retrieveByIdentityResponse.ID
 		}
+		authReq := &magistrala.AuthorizeReq{
+			SubjectType: authsvc.UserType,
+			SubjectKind: authsvc.UsersKind,
+			Subject:     id,
+			Permission:  authsvc.MembershipPermission,
+			ObjectType:  authsvc.PlatformType,
+			Object:      authsvc.MagistralaObject,
+		}
+		repoCall := cRepo.On("RetrieveByIdentity", context.Background(), tc.client.Credentials.Identity).Return(tc.retrieveByIdentityResponse, tc.retrieveByIdentityErr)
+		repoCall1 := cRepo.On("Save", context.Background(), mock.Anything).Return(tc.saveResponse, tc.saveErr)
+		authCall := auth.On("Issue", mock.Anything, mock.Anything).Return(tc.issueResponse, tc.issueErr)
+		authCall1 := auth.On("AddPolicies", mock.Anything, mock.Anything).Return(tc.addPoliciesResponse, tc.addPoliciesErr)
+		authCall2 := auth.On("Authorize", mock.Anything, authReq).Return(tc.authorizeResponse, tc.authorizeErr)
+		retrieveAllCall := cRepo.On("RetrieveAll", mock.Anything, mgclients.Page{}).Return(mgclients.ClientsPage{Page: mgclients.Page{Total: tc.total}}, nil)
+		token, err := svc.OAuthCallback(context.Background(), tc.client)
+		if err == nil {
+			assert.Equal(t, tc.issueResponse.AccessToken, token.AccessToken)
+			assert.Equal(t, tc.issueResponse.RefreshToken, token.RefreshToken)
+		}
+		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
+		repoCall.Parent.AssertCalled(t, "RetrieveByIdentity", context.Background(), tc.client.Credentials.Identity)
+		repoCall.Unset()
+		repoCall1.Unset()
+		authCall.Unset()
+		authCall1.Unset()
+		authCall2.Unset()
+		retrieveAllCall.Unset()
 	}
 }

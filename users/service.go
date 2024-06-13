@@ -5,7 +5,6 @@ package users
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/absmach/magistrala"
@@ -14,37 +13,37 @@ import (
 	"github.com/absmach/magistrala/pkg/errors"
 	repoerr "github.com/absmach/magistrala/pkg/errors/repository"
 	svcerr "github.com/absmach/magistrala/pkg/errors/service"
-	mgoauth2 "github.com/absmach/magistrala/pkg/oauth2"
 	"github.com/absmach/magistrala/users/postgres"
 	"golang.org/x/sync/errgroup"
 )
 
 var (
 	errIssueToken            = errors.New("failed to issue token")
-	errUserNotSignedUp       = errors.New("user not signed up")
 	errFailedPermissionsList = errors.New("failed to list permissions")
 	errRecoveryToken         = errors.New("failed to generate password recovery token")
 	errLoginDisableUser      = errors.New("failed to login in disabled user")
 )
 
 type service struct {
-	clients      postgres.Repository
-	idProvider   magistrala.IDProvider
-	auth         magistrala.AuthServiceClient
-	hasher       Hasher
-	email        Emailer
-	selfRegister bool
+	clients             postgres.Repository
+	idProvider          magistrala.IDProvider
+	constraintsProvider magistrala.Constraints
+	auth                magistrala.AuthServiceClient
+	hasher              Hasher
+	email               Emailer
+	selfRegister        bool
 }
 
 // NewService returns a new Users service implementation.
-func NewService(crepo postgres.Repository, authClient magistrala.AuthServiceClient, emailer Emailer, hasher Hasher, idp magistrala.IDProvider, selfRegister bool) Service {
+func NewService(crepo postgres.Repository, authClient magistrala.AuthServiceClient, emailer Emailer, hasher Hasher, idp magistrala.IDProvider, constpr magistrala.Constraints, selfRegister bool) Service {
 	return service{
-		clients:      crepo,
-		auth:         authClient,
-		hasher:       hasher,
-		email:        emailer,
-		idProvider:   idp,
-		selfRegister: selfRegister,
+		clients:             crepo,
+		auth:                authClient,
+		hasher:              hasher,
+		email:               emailer,
+		idProvider:          idp,
+		selfRegister:        selfRegister,
+		constraintsProvider: constpr,
 	}
 }
 
@@ -60,6 +59,16 @@ func (svc service) RegisterClient(ctx context.Context, token string, cli mgclien
 	}
 
 	clientID, err := svc.idProvider.ID()
+	if err != nil {
+		return mgclients.Client{}, err
+	}
+
+	platformUsers, err := svc.clients.RetrieveAll(ctx, mgclients.Page{})
+	if err != nil {
+		return mgclients.Client{}, errors.Wrap(svcerr.ErrViewEntity, err)
+	}
+
+	err = svc.constraintsProvider.CheckLimits(magistrala.Create, platformUsers.Total)
 	if err != nil {
 		return mgclients.Client{}, err
 	}
@@ -87,7 +96,7 @@ func (svc service) RegisterClient(ctx context.Context, token string, cli mgclien
 	defer func() {
 		if err != nil {
 			if errRollback := svc.addClientPolicyRollback(ctx, cli.ID, cli.Role); errRollback != nil {
-				err = errors.Wrap(errors.Wrap(repoerr.ErrRollbackTx, errRollback), err)
+				err = errors.Wrap(errors.Wrap(errors.ErrRollbackTx, errRollback), err)
 			}
 		}
 	}()
@@ -95,6 +104,7 @@ func (svc service) RegisterClient(ctx context.Context, token string, cli mgclien
 	if err != nil {
 		return mgclients.Client{}, errors.Wrap(svcerr.ErrCreateEntity, err)
 	}
+
 	return client, nil
 }
 
@@ -386,9 +396,14 @@ func (svc service) UpdateClientRole(ctx context.Context, token string, cli mgcli
 		UpdatedBy: tokenUserID,
 	}
 
+	if _, err := svc.authorize(ctx, auth.UserType, auth.UsersKind, client.ID, auth.MembershipPermission, auth.PlatformType, auth.MagistralaObject); err != nil {
+		return mgclients.Client{}, err
+	}
+
 	if err := svc.updateClientPolicy(ctx, cli.ID, cli.Role); err != nil {
 		return mgclients.Client{}, err
 	}
+
 	client, err = svc.clients.UpdateRole(ctx, client)
 	if err != nil {
 		// If failed to update role in DB, then revert back to platform admin policy in spicedb
@@ -592,37 +607,32 @@ func (svc *service) authorize(ctx context.Context, subjType, subjKind, subj, per
 	return res.GetId(), nil
 }
 
-func (svc service) OAuthCallback(ctx context.Context, state mgoauth2.State, client mgclients.Client) (*magistrala.Token, error) {
-	switch state {
-	case mgoauth2.SignIn:
-		rclient, err := svc.clients.RetrieveByIdentity(ctx, client.Credentials.Identity)
-		if err != nil {
-			if errors.Contains(err, repoerr.ErrNotFound) {
-				return &magistrala.Token{}, errors.Wrap(svcerr.ErrNotFound, errUserNotSignedUp)
+func (svc service) OAuthCallback(ctx context.Context, client mgclients.Client) (*magistrala.Token, error) {
+	rclient, err := svc.clients.RetrieveByIdentity(ctx, client.Credentials.Identity)
+	if err != nil {
+		switch errors.Contains(err, repoerr.ErrNotFound) {
+		case true:
+			rclient, err = svc.RegisterClient(ctx, "", client)
+			if err != nil {
+				return &magistrala.Token{}, err
 			}
-			return &magistrala.Token{}, errors.Wrap(svcerr.ErrViewEntity, err)
-		}
-		claims := &magistrala.IssueReq{
-			UserId: rclient.ID,
-			Type:   uint32(auth.AccessKey),
-		}
-		return svc.auth.Issue(ctx, claims)
-	case mgoauth2.SignUp:
-		rclient, err := svc.RegisterClient(ctx, "", client)
-		if err != nil {
-			if errors.Contains(err, repoerr.ErrConflict) {
-				return &magistrala.Token{}, errors.Wrap(svcerr.ErrConflict, errors.New("user already exists"))
-			}
+		default:
 			return &magistrala.Token{}, err
 		}
-		claims := &magistrala.IssueReq{
-			UserId: rclient.ID,
-			Type:   uint32(auth.AccessKey),
-		}
-		return svc.auth.Issue(ctx, claims)
-	default:
-		return &magistrala.Token{}, fmt.Errorf("unknown state %s", state)
 	}
+
+	if _, err = svc.authorize(ctx, auth.UserType, auth.UsersKind, rclient.ID, auth.MembershipPermission, auth.PlatformType, auth.MagistralaObject); err != nil {
+		if err := svc.addClientPolicy(ctx, rclient.ID, rclient.Role); err != nil {
+			return &magistrala.Token{}, err
+		}
+	}
+
+	claims := &magistrala.IssueReq{
+		UserId: rclient.ID,
+		Type:   uint32(auth.AccessKey),
+	}
+
+	return svc.auth.Issue(ctx, claims)
 }
 
 func (svc service) Identify(ctx context.Context, token string) (string, error) {

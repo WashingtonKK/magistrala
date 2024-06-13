@@ -105,27 +105,29 @@ type Service interface {
 var _ Service = (*service)(nil)
 
 type service struct {
-	keys               KeyRepository
-	domains            DomainsRepository
-	idProvider         magistrala.IDProvider
-	agent              PolicyAgent
-	tokenizer          Tokenizer
-	loginDuration      time.Duration
-	refreshDuration    time.Duration
-	invitationDuration time.Duration
+	keys                KeyRepository
+	domains             DomainsRepository
+	idProvider          magistrala.IDProvider
+	constraintsProvider magistrala.Constraints
+	agent               PolicyAgent
+	tokenizer           Tokenizer
+	loginDuration       time.Duration
+	refreshDuration     time.Duration
+	invitationDuration  time.Duration
 }
 
 // New instantiates the auth service implementation.
-func New(keys KeyRepository, domains DomainsRepository, idp magistrala.IDProvider, tokenizer Tokenizer, policyAgent PolicyAgent, loginDuration, refreshDuration, invitationDuration time.Duration) Service {
+func New(keys KeyRepository, domains DomainsRepository, idp magistrala.IDProvider, constrProvider magistrala.Constraints, tokenizer Tokenizer, policyAgent PolicyAgent, loginDuration, refreshDuration, invitationDuration time.Duration) Service {
 	return &service{
-		tokenizer:          tokenizer,
-		domains:            domains,
-		keys:               keys,
-		idProvider:         idp,
-		agent:              policyAgent,
-		loginDuration:      loginDuration,
-		refreshDuration:    refreshDuration,
-		invitationDuration: invitationDuration,
+		tokenizer:           tokenizer,
+		domains:             domains,
+		keys:                keys,
+		idProvider:          idp,
+		agent:               policyAgent,
+		loginDuration:       loginDuration,
+		refreshDuration:     refreshDuration,
+		invitationDuration:  invitationDuration,
+		constraintsProvider: constrProvider,
 	}
 }
 
@@ -571,10 +573,12 @@ func SwitchToPermission(relation string) string {
 		return AdminPermission
 	case EditorRelation:
 		return EditPermission
-	case ViewerRelation:
+	case ContributorRelation:
 		return ViewPermission
 	case MemberRelation:
 		return MembershipPermission
+	case GuestRelation:
+		return ViewPermission
 	default:
 		return relation
 	}
@@ -586,6 +590,16 @@ func (svc service) CreateDomain(ctx context.Context, token string, d Domain) (do
 		return Domain{}, errors.Wrap(svcerr.ErrAuthentication, err)
 	}
 	d.CreatedBy = key.User
+
+	ds, err := svc.domains.ListDomains(ctx, Page{})
+	if err != nil {
+		return Domain{}, err
+	}
+
+	err = svc.constraintsProvider.CheckLimits(magistrala.Create, ds.Total)
+	if err != nil {
+		return Domain{}, err
+	}
 
 	domainID, err := svc.idProvider.ID()
 	if err != nil {
@@ -661,7 +675,7 @@ func (svc service) RetrieveDomainPermissions(ctx context.Context, token, id stri
 		Subject:     res.Subject,
 		Object:      id,
 		ObjectType:  DomainType,
-	}, []string{AdminPermission, EditPermission, ViewPermission, MembershipPermission})
+	}, []string{AdminPermission, EditPermission, ViewPermission, MembershipPermission, CreatePermission})
 	if err != nil {
 		return []string{}, errors.Wrap(svcerr.ErrViewEntity, err)
 	}
@@ -824,7 +838,7 @@ func (svc service) UnassignUsers(ctx context.Context, token, id string, userIds 
 		userIds = ids
 	}
 
-	for _, rel := range []string{MemberRelation, ViewerRelation, EditorRelation} {
+	for _, rel := range []string{MemberRelation, ContributorRelation, EditorRelation, GuestRelation} {
 		// Remove only non-admins.
 		if err := svc.removeDomainPolicies(ctx, id, rel, userIds...); err != nil {
 			return err

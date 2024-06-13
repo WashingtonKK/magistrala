@@ -17,21 +17,23 @@ import (
 )
 
 type service struct {
-	auth        magistrala.AuthServiceClient
-	clients     postgres.Repository
-	clientCache Cache
-	idProvider  magistrala.IDProvider
-	grepo       mggroups.Repository
+	auth                magistrala.AuthServiceClient
+	clients             postgres.Repository
+	clientCache         Cache
+	idProvider          magistrala.IDProvider
+	grepo               mggroups.Repository
+	constraintsProvider magistrala.Constraints
 }
 
 // NewService returns a new Clients service implementation.
-func NewService(uauth magistrala.AuthServiceClient, c postgres.Repository, grepo mggroups.Repository, tcache Cache, idp magistrala.IDProvider) Service {
+func NewService(uauth magistrala.AuthServiceClient, c postgres.Repository, grepo mggroups.Repository, tcache Cache, idp magistrala.IDProvider, constpr magistrala.Constraints) Service {
 	return service{
-		auth:        uauth,
-		clients:     c,
-		grepo:       grepo,
-		clientCache: tcache,
-		idProvider:  idp,
+		auth:                uauth,
+		clients:             c,
+		grepo:               grepo,
+		clientCache:         tcache,
+		idProvider:          idp,
+		constraintsProvider: constpr,
 	}
 }
 
@@ -65,7 +67,16 @@ func (svc service) CreateThings(ctx context.Context, token string, cls ...mgclie
 		return []mgclients.Client{}, err
 	}
 	// If domain is disabled , then this authorization will fail for all non-admin domain users
-	if _, err := svc.authorize(ctx, "", auth.UserType, auth.UsersKind, user.GetId(), auth.MembershipPermission, auth.DomainType, user.GetDomainId()); err != nil {
+	if _, err := svc.authorize(ctx, "", auth.UserType, auth.UsersKind, user.GetId(), auth.CreatePermission, auth.DomainType, user.GetDomainId()); err != nil {
+		return []mgclients.Client{}, err
+	}
+	ths, err := svc.clients.RetrieveAll(ctx, mgclients.Page{})
+	if err != nil {
+		return []mgclients.Client{}, errors.Wrap(svcerr.ErrViewEntity, err)
+	}
+
+	err = svc.constraintsProvider.CheckLimits(magistrala.Create, ths.Total)
+	if err != nil {
 		return []mgclients.Client{}, err
 	}
 
@@ -93,32 +104,19 @@ func (svc service) CreateThings(ctx context.Context, token string, cls ...mgclie
 		clients = append(clients, c)
 	}
 
+	if err := svc.addThingPolicies(ctx, user.GetId(), user.GetDomainId(), clients); err != nil {
+		return []mgclients.Client{}, err
+	}
+	defer func() {
+		if err != nil {
+			if errRollback := svc.addThingPoliciesRollback(ctx, user.GetId(), user.GetDomainId(), clients); errRollback != nil {
+				err = errors.Wrap(errors.Wrap(errors.ErrRollbackTx, errRollback), err)
+			}
+		}
+	}()
+
 	saved, err := svc.clients.Save(ctx, clients...)
 	if err != nil {
-		return nil, errors.Wrap(svcerr.ErrCreateEntity, err)
-	}
-
-	policies := magistrala.AddPoliciesReq{}
-	for _, c := range saved {
-		policies.AddPoliciesReq = append(policies.AddPoliciesReq, &magistrala.AddPolicyReq{
-			Domain:      user.GetDomainId(),
-			SubjectType: auth.UserType,
-			Subject:     user.GetId(),
-			Relation:    auth.AdministratorRelation,
-			ObjectKind:  auth.NewThingKind,
-			ObjectType:  auth.ThingType,
-			Object:      c.ID,
-		})
-		policies.AddPoliciesReq = append(policies.AddPoliciesReq, &magistrala.AddPolicyReq{
-			Domain:      user.GetDomainId(),
-			SubjectType: auth.DomainType,
-			Subject:     user.GetDomainId(),
-			Relation:    auth.DomainRelation,
-			ObjectType:  auth.ThingType,
-			Object:      c.ID,
-		})
-	}
-	if _, err := svc.auth.AddPolicies(ctx, &policies); err != nil {
 		return nil, errors.Wrap(svcerr.ErrCreateEntity, err)
 	}
 
@@ -608,4 +606,62 @@ func (svc *service) authorize(ctx context.Context, domainID, subjType, subjKind,
 	}
 
 	return res.GetId(), nil
+}
+
+func (svc service) addThingPolicies(ctx context.Context, userID, domainID string, things []mgclients.Client) error {
+	policies := magistrala.AddPoliciesReq{}
+	for _, thing := range things {
+		policies.AddPoliciesReq = append(policies.AddPoliciesReq, &magistrala.AddPolicyReq{
+			Domain:      domainID,
+			SubjectType: auth.UserType,
+			Subject:     userID,
+			Relation:    auth.AdministratorRelation,
+			ObjectKind:  auth.NewThingKind,
+			ObjectType:  auth.ThingType,
+			Object:      thing.ID,
+		})
+		policies.AddPoliciesReq = append(policies.AddPoliciesReq, &magistrala.AddPolicyReq{
+			Domain:      domainID,
+			SubjectType: auth.DomainType,
+			Subject:     domainID,
+			Relation:    auth.DomainRelation,
+			ObjectType:  auth.ThingType,
+			Object:      thing.ID,
+		})
+	}
+
+	if _, err := svc.auth.AddPolicies(ctx, &policies); err != nil {
+		return errors.Wrap(svcerr.ErrCreateEntity, err)
+	}
+
+	return nil
+}
+
+func (svc service) addThingPoliciesRollback(ctx context.Context, userID, domainID string, things []mgclients.Client) error {
+	policies := magistrala.DeletePoliciesReq{}
+	for _, thing := range things {
+		policies.DeletePoliciesReq = append(policies.DeletePoliciesReq, &magistrala.DeletePolicyReq{
+			Domain:      domainID,
+			SubjectType: auth.UserType,
+			Subject:     userID,
+			Relation:    auth.AdministratorRelation,
+			ObjectKind:  auth.NewThingKind,
+			ObjectType:  auth.ThingType,
+			Object:      thing.ID,
+		})
+		policies.DeletePoliciesReq = append(policies.DeletePoliciesReq, &magistrala.DeletePolicyReq{
+			Domain:      domainID,
+			SubjectType: auth.DomainType,
+			Subject:     domainID,
+			Relation:    auth.DomainRelation,
+			ObjectType:  auth.ThingType,
+			Object:      thing.ID,
+		})
+	}
+
+	if _, err := svc.auth.DeletePolicies(ctx, &policies); err != nil {
+		return errors.Wrap(svcerr.ErrRemoveEntity, err)
+	}
+
+	return nil
 }

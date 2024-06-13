@@ -13,6 +13,7 @@ import (
 	authmocks "github.com/absmach/magistrala/auth/mocks"
 	"github.com/absmach/magistrala/internal/testsutil"
 	mgclients "github.com/absmach/magistrala/pkg/clients"
+	constraints "github.com/absmach/magistrala/pkg/constraints/config"
 	"github.com/absmach/magistrala/pkg/errors"
 	repoerr "github.com/absmach/magistrala/pkg/errors/repository"
 	svcerr "github.com/absmach/magistrala/pkg/errors/service"
@@ -50,10 +51,11 @@ func newService() (things.Service, *mocks.Repository, *authmocks.AuthClient, *mo
 	auth := new(authmocks.AuthClient)
 	thingCache := new(mocks.Cache)
 	idProvider := uuid.NewMock()
+	constrProvider, _ := constraints.New("things_test")
 	cRepo := new(mocks.Repository)
 	gRepo := new(gmocks.Repository)
 
-	return things.NewService(auth, cRepo, gRepo, thingCache, idProvider), cRepo, auth, thingCache
+	return things.NewService(auth, cRepo, gRepo, thingCache, idProvider, constrProvider), cRepo, auth, thingCache
 }
 
 func TestCreateThings(t *testing.T) {
@@ -65,11 +67,14 @@ func TestCreateThings(t *testing.T) {
 		token             string
 		authResponse      *magistrala.AuthorizeRes
 		addPolicyResponse *magistrala.AddPoliciesRes
+		deletePolicyRes   *magistrala.DeletePoliciesRes
 		authorizeErr      error
 		identifyErr       error
 		addPolicyErr      error
+		deletePolicyErr   error
 		saveErr           error
 		err               error
+		total             uint64
 	}{
 		{
 			desc:         "create a new thing successfully",
@@ -305,13 +310,36 @@ func TestCreateThings(t *testing.T) {
 			addPolicyErr:      svcerr.ErrInvalidPolicy,
 			err:               svcerr.ErrInvalidPolicy,
 		},
+		{
+			desc: "create a new thing with failed delete policy response",
+			thing: mgclients.Client{
+				Credentials: mgclients.Credentials{
+					Identity: "newclientwithfailedpolicy@example.com",
+					Secret:   secret,
+				},
+				Status: mgclients.EnabledStatus,
+			},
+			token:             validToken,
+			authResponse:      &magistrala.AuthorizeRes{Authorized: true},
+			addPolicyResponse: &magistrala.AddPoliciesRes{Added: true},
+			saveErr:           repoerr.ErrConflict,
+			deletePolicyRes:   &magistrala.DeletePoliciesRes{Deleted: false},
+			deletePolicyErr:   svcerr.ErrInvalidPolicy,
+			err:               repoerr.ErrConflict,
+		},
 	}
 
 	for _, tc := range cases {
 		repoCall := auth.On("Identify", mock.Anything, &magistrala.IdentityReq{Token: tc.token}).Return(&magistrala.IdentityRes{Id: validID, DomainId: testsutil.GenerateUUID(t)}, tc.identifyErr)
-		repoCall1 := auth.On("Authorize", mock.Anything, mock.Anything).Return(tc.authResponse, tc.authorizeErr)
-		repoCall2 := cRepo.On("Save", context.Background(), mock.Anything).Return([]mgclients.Client{tc.thing}, tc.saveErr)
-		repoCall3 := auth.On("AddPolicies", mock.Anything, mock.Anything).Return(tc.addPolicyResponse, tc.addPolicyErr)
+		authcall := auth.On("Authorize", mock.Anything, mock.Anything).Return(tc.authResponse, tc.authorizeErr)
+		repoCall1 := cRepo.On("Save", context.Background(), mock.Anything).Return([]mgclients.Client{tc.thing}, tc.saveErr)
+		authCall1 := auth.On("AddPolicies", mock.Anything, mock.Anything).Return(tc.addPolicyResponse, tc.addPolicyErr)
+		authCall2 := auth.On("DeletePolicies", mock.Anything, mock.Anything).Return(tc.deletePolicyRes, tc.deletePolicyErr)
+		retrieveAllCall := cRepo.On("RetrieveAll", mock.Anything, mgclients.Page{}).Return(mgclients.ClientsPage{
+			Page: mgclients.Page{
+				Total: tc.total,
+			},
+		}, nil)
 		expected, err := svc.CreateThings(context.Background(), tc.token, tc.thing)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 		if err == nil {
@@ -324,9 +352,11 @@ func TestCreateThings(t *testing.T) {
 			assert.Equal(t, tc.thing, expected[0], fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.thing, expected[0]))
 		}
 		repoCall.Unset()
+		authcall.Unset()
 		repoCall1.Unset()
-		repoCall2.Unset()
-		repoCall3.Unset()
+		authCall1.Unset()
+		authCall2.Unset()
+		retrieveAllCall.Unset()
 	}
 }
 
